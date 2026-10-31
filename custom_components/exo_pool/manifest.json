@@ -8,5 +8,5 @@
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/benjycov/exo_pool/issues",
   "requirements": ["awsiotsdk>=1.28.0"],
-  "version": "0.2.0"
+  "version": "0.2.0.1"
 }
