@@ -55,6 +55,45 @@ class TestReportedMatches(unittest.TestCase):
         self.assertFalse(wv.reported_matches(None, KEYS, 0))
 
 
+class TestPendingWrites(unittest.TestCase):
+    def setUp(self):
+        self.now = 0.0
+        self.pending = wv.PendingWrites(clock=lambda: self.now)
+
+    def _production(self, data):
+        return data["equipment"]["swc_0"]["production"]
+
+    def test_echo_of_old_state_is_hidden(self):
+        """The 2026-10-31 16:37 flicker: off, echo says on, then off."""
+        self.pending.add("pool:production", KEYS, 0)
+        echo = _reported(1)
+        shown = self.pending.apply(echo)
+        self.assertEqual(self._production(shown), 0)
+        self.assertEqual(self._production(echo), 1)  # input not changed
+
+    def test_cleared_once_device_reports_it(self):
+        self.pending.add("pool:production", KEYS, 0)
+        self.assertEqual(self._production(self.pending.apply(_reported(0))), 0)
+        # Later the device really turns on again (e.g. its own schedule).
+        self.assertEqual(self._production(self.pending.apply(_reported(1))), 1)
+
+    def test_expires(self):
+        self.pending.add("pool:production", KEYS, 0)
+        self.now = wv.PENDING_MAX_AGE + 1
+        self.assertEqual(self._production(self.pending.apply(_reported(1))), 1)
+
+    def test_clear_only_matching_value(self):
+        self.pending.add("pool:production", KEYS, 1)  # newer write
+        self.pending.clear("pool:production", 0)  # older check finishing
+        self.assertEqual(self._production(self.pending.apply(_reported(0))), 1)
+        self.pending.clear("pool:production", 1)
+        self.assertEqual(self._production(self.pending.apply(_reported(0))), 0)
+
+    def test_nothing_pending_returns_same_object(self):
+        data = _reported(1)
+        self.assertIs(self.pending.apply(data), data)
+
+
 class TestVerifyWrite(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.watcher = wv.ReportedWatcher()

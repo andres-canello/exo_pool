@@ -10,7 +10,9 @@ This module has no Home Assistant imports so it can be tested on its own.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
+import time
 from typing import Awaitable, Callable
 
 _LOGGER = logging.getLogger(__name__)
@@ -18,6 +20,47 @@ _LOGGER = logging.getLogger(__name__)
 VERIFY_TIMEOUT = 20.0  # device normally reports back within 2-8 s
 VERIFY_ATTEMPTS = 3  # first send + 2 resends
 STATE_REQUEST_WAIT = 5.0  # extra wait after asking for a fresh shadow
+PENDING_MAX_AGE = 120.0  # never hide the real state longer than this
+
+
+class PendingWrites:
+    """Keep showing a sent value until the device reports it.
+
+    Right after a write, AWS IoT echoes the shadow back with the old
+    reported value, so a switch went off -> on -> off in the UI. While a
+    write is pending, incoming reports get the sent value laid over them.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._pending: dict[str, tuple[list[str], object, float]] = {}
+
+    def add(self, key: str, keys: list[str], value) -> None:
+        self._pending[key] = (keys, value, self._clock())
+
+    def clear(self, key: str, value=None) -> None:
+        """Drop a pending value. With value, only if it is still that value."""
+        entry = self._pending.get(key)
+        if entry and (value is None or entry[1] == value):
+            del self._pending[key]
+
+    def apply(self, reported: dict) -> dict:
+        """Return reported with any still-pending values laid over it."""
+        if not self._pending:
+            return reported
+        now = self._clock()
+        result = reported
+        for key, (keys, value, since) in list(self._pending.items()):
+            if now - since > PENDING_MAX_AGE or reported_matches(reported, keys, value):
+                del self._pending[key]
+                continue
+            if result is reported:
+                result = copy.deepcopy(reported)
+            node = result
+            for part in keys[:-1]:
+                node = node.setdefault(part, {})
+            node[keys[-1]] = value
+        return result
 
 
 def _lookup(data: dict | None, keys: list[str]):

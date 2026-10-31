@@ -13,7 +13,7 @@ import logging
 import time
 import asyncio
 
-from .write_verify import ReportedWatcher, verify_write
+from .write_verify import PendingWrites, ReportedWatcher, verify_write
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -320,6 +320,7 @@ class _WriteManager:
                 _cancel_verify(store, item.key)
                 transport = await _execute_write(self._hass, self._entry, item)
             except Exception as err:
+                _get_pending(store).clear(item.key)
                 for future in item.futures:
                     if not future.done():
                         future.set_exception(err)
@@ -343,6 +344,8 @@ class _WriteManager:
                 )
                 if transport == "mqtt" and item.kind == "pool":
                     _start_verify(self._hass, self._entry, item)
+                else:
+                    _get_pending(store).clear(item.key)
                 if item.kind == "schedule":
                     _schedule_debounced_refresh(
                         self._hass, self._entry, delay=SCHEDULE_REFRESH_DELAY
@@ -766,6 +769,10 @@ def _apply_schedule_update(
     coordinator.async_set_updated_data(data)
 
 
+def _get_pending(store: dict) -> PendingWrites:
+    return store.setdefault("pending_writes", PendingWrites())
+
+
 def _cancel_verify(store: dict, key: str) -> None:
     """Stop checking an older write once a newer one for the same key goes out."""
     if task := store.get("verify_tasks", {}).pop(key, None):
@@ -788,8 +795,9 @@ def _start_verify(hass: HomeAssistant, entry: ConfigEntry, item: _WriteItem) -> 
             mqtt_client.request_shadow()
 
     async def _run() -> None:
+        applied = False
         try:
-            await verify_write(
+            applied = await verify_write(
                 watcher,
                 keys,
                 desired,
@@ -802,6 +810,11 @@ def _start_verify(hass: HomeAssistant, entry: ConfigEntry, item: _WriteItem) -> 
         except Exception:
             _LOGGER.warning("Checking write %s failed", item.key, exc_info=True)
         finally:
+            # A newer write for the same key keeps its own pending value.
+            _get_pending(store).clear(item.key, desired)
+            if not applied:
+                # Stop showing the value we sent; fetch the real state.
+                _request_state()
             tasks = store.get("verify_tasks", {})
             if tasks.get(item.key) is task:
                 tasks.pop(item.key, None)
@@ -1032,10 +1045,12 @@ def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     watcher: ReportedWatcher = store.setdefault("reported_watcher", ReportedWatcher())
 
+    pending = _get_pending(store)
+
     def _on_shadow_update(reported: dict) -> None:
         """Called on HA event loop when MQTT delivers a shadow update."""
-        coordinator.async_set_updated_data(reported)
         watcher.notify(reported)
+        coordinator.async_set_updated_data(pending.apply(reported))
 
     mqtt_client.set_shadow_callback(_on_shadow_update)
 
@@ -1202,7 +1217,9 @@ async def set_pool_value(hass, entry, setting, value, delay_refresh=False):
 
     keys = setting.split(".")
     nested_value = _build_nested_dict(keys, value)
-    coordinator = _get_entry_store(hass, entry).get("coordinator")
+    store = _get_entry_store(hass, entry)
+    _get_pending(store).add(f"pool:{setting}", ["equipment", "swc_0"] + keys, value)
+    coordinator = store.get("coordinator")
     if coordinator:
         _apply_desired_update(coordinator, ["equipment", "swc_0"] + keys, value)
 
