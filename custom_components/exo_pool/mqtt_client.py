@@ -121,22 +121,29 @@ class ExoMqttClient:
             self._connection = None
         self._connected = False
 
-    def publish_desired(self, desired: dict) -> None:
+    def publish_desired(self, desired: dict):
         """Publish a desired state change to the device shadow.
 
-        Raises ConnectionError if not connected.
+        Returns the CRT future that completes when AWS IoT acks the publish
+        (PUBACK). Raises ConnectionError if not connected.
         """
         if not self._connected or self._connection is None:
             raise ConnectionError("MQTT not connected")
 
         topic = _SHADOW_UPDATE.format(serial=self._serial)
         payload = json.dumps({"state": {"desired": desired}})
-        self._connection.publish(
+        future, _ = self._connection.publish(
             topic=topic,
             payload=payload,
             qos=mqtt.QoS.AT_LEAST_ONCE,
         )
         _LOGGER.info("MQTT write: %s", desired)
+        return future
+
+    def request_shadow(self) -> None:
+        """Ask AWS IoT for the full shadow (answer arrives on get/accepted)."""
+        if self._connected and self._connection is not None:
+            self._request_shadow()
 
     def _build_connection(self, credentials: dict) -> mqtt.Connection:
         """Build an MQTT connection with SigV4 WebSocket auth."""

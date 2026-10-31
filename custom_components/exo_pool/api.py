@@ -13,6 +13,8 @@ import logging
 import time
 import asyncio
 
+from .write_verify import ReportedWatcher, verify_write
+
 _LOGGER = logging.getLogger(__name__)
 
 # Header names we want to surface when present on any response
@@ -108,6 +110,7 @@ IOT_ENDPOINT = "a1zi08qpbrtjyq-ats.iot.us-east-1.amazonaws.com"
 IOT_REGION = "us-east-1"
 MQTT_CREDENTIAL_REFRESH_BUFFER = 300  # refresh 5 min before expiry
 REST_FALLBACK_INTERVAL = 3600  # 1 hour REST poll - last resort when MQTT is dead
+PUBACK_TIMEOUT = 10.0  # wait this long for AWS IoT to ack an MQTT write
 
 
 async def _async_rate_limit(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -314,7 +317,8 @@ class _WriteManager:
             try:
                 store = _get_entry_store(self._hass, self._entry)
                 store["write_in_flight"] = store.get("write_in_flight", 0) + 1
-                await _execute_write(self._hass, self._entry, item)
+                _cancel_verify(store, item.key)
+                transport = await _execute_write(self._hass, self._entry, item)
             except Exception as err:
                 for future in item.futures:
                     if not future.done():
@@ -323,16 +327,22 @@ class _WriteManager:
                 for future in item.futures:
                     if not future.done():
                         future.set_result(None)
-                _set_cooldown(
-                    self._hass,
-                    self._entry,
-                    POST_WRITE_COOLDOWN_SECONDS + item.extra_delay,
-                    reason="post_write",
-                )
+                # The cooldown protects the REST API's rate limit. MQTT has
+                # none, and holding the next MQTT write for ~55 s made quick
+                # off/on sequences look like they failed.
+                if transport == "rest":
+                    _set_cooldown(
+                        self._hass,
+                        self._entry,
+                        POST_WRITE_COOLDOWN_SECONDS + item.extra_delay,
+                        reason="post_write",
+                    )
                 store = _get_entry_store(self._hass, self._entry)
                 store["write_quiet_until"] = (
                     time.monotonic() + POST_WRITE_COOLDOWN_SECONDS
                 )
+                if transport == "mqtt" and item.kind == "pool":
+                    _start_verify(self._hass, self._entry, item)
                 if item.kind == "schedule":
                     _schedule_debounced_refresh(
                         self._hass, self._entry, delay=SCHEDULE_REFRESH_DELAY
@@ -756,9 +766,62 @@ def _apply_schedule_update(
     coordinator.async_set_updated_data(data)
 
 
+def _cancel_verify(store: dict, key: str) -> None:
+    """Stop checking an older write once a newer one for the same key goes out."""
+    if task := store.get("verify_tasks", {}).pop(key, None):
+        task.cancel()
+
+
+def _start_verify(hass: HomeAssistant, entry: ConfigEntry, item: _WriteItem) -> None:
+    """Check in the background that the device applied a pool write."""
+    store = _get_entry_store(hass, entry)
+    watcher: ReportedWatcher = store.setdefault("reported_watcher", ReportedWatcher())
+    keys = ["equipment", "swc_0"] + item.target.split(".")
+    desired = _lookup_nested(item.payload, item.target.split("."))
+
+    async def _resend() -> None:
+        await _execute_write(hass, entry, item)
+
+    def _request_state() -> None:
+        mqtt_client = store.get("mqtt_client")
+        if mqtt_client:
+            mqtt_client.request_shadow()
+
+    async def _run() -> None:
+        try:
+            await verify_write(
+                watcher,
+                keys,
+                desired,
+                resend=_resend,
+                request_state=_request_state,
+                label=f"Write {item.target}={desired}",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.warning("Checking write %s failed", item.key, exc_info=True)
+        finally:
+            tasks = store.get("verify_tasks", {})
+            if tasks.get(item.key) is task:
+                tasks.pop(item.key, None)
+
+    task = hass.async_create_background_task(
+        _run(), name=f"exo_pool_verify_{item.key}"
+    )
+    store.setdefault("verify_tasks", {})[item.key] = task
+
+
+def _lookup_nested(data, keys: list[str]):
+    for key in keys:
+        data = data[key]
+    return data
+
+
 async def _execute_write(
     hass: HomeAssistant, entry: ConfigEntry, item: _WriteItem
-) -> None:
+) -> str:
+    """Send a write. Returns "mqtt" or "rest" for the path that was used."""
     if item.kind == "pool":
         desired = {"equipment": {"swc_0": item.payload}}
     elif item.kind == "heating":
@@ -774,8 +837,11 @@ async def _execute_write(
     if mqtt_client and mqtt_client.connected:
         _LOGGER.debug("Writing %s via MQTT: %s", item.key, desired)
         try:
-            mqtt_client.publish_desired(desired)
-            return
+            puback = mqtt_client.publish_desired(desired)
+            # Without waiting for the ack, a publish on a half-dead
+            # connection was reported as success and silently lost.
+            await asyncio.wait_for(asyncio.wrap_future(puback), PUBACK_TIMEOUT)
+            return "mqtt"
         except Exception:
             _LOGGER.warning(
                 "MQTT write failed for %s - falling back to REST",
@@ -786,6 +852,7 @@ async def _execute_write(
     # REST fallback
     _LOGGER.debug("Writing %s via REST fallback", item.key)
     await _execute_write_rest(hass, entry, item, desired)
+    return "rest"
 
 
 async def _execute_write_rest(
@@ -963,9 +1030,12 @@ def _connect_mqtt(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         store["mqtt_client"] = mqtt_client
 
+    watcher: ReportedWatcher = store.setdefault("reported_watcher", ReportedWatcher())
+
     def _on_shadow_update(reported: dict) -> None:
         """Called on HA event loop when MQTT delivers a shadow update."""
         coordinator.async_set_updated_data(reported)
+        watcher.notify(reported)
 
     mqtt_client.set_shadow_callback(_on_shadow_update)
 
@@ -1058,6 +1128,8 @@ def cleanup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     for task_key in ("credential_refresh_task", "debounce_refresh_task", "boost_task"):
         if task := store.get(task_key):
             task.cancel()
+    for task in store.pop("verify_tasks", {}).values():
+        task.cancel()
 
 
 async def get_coordinator(hass: HomeAssistant, entry: ConfigEntry):

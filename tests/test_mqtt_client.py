@@ -341,6 +341,29 @@ class TestPublishDesired:
         )
         assert payload == {"state": {"desired": desired}}
 
+    def test_publish_desired_returns_puback_future(
+        self, build_client, mock_mqtt_connection
+    ):
+        client = build_client()
+        client.connect(SAMPLE_CREDENTIALS)
+
+        future = client.publish_desired({"equipment": {"swc_0": {"production": 0}}})
+
+        assert future is mock_mqtt_connection.publish.return_value[0]
+
+    def test_request_shadow_publishes_get(self, build_client, mock_mqtt_connection):
+        client = build_client()
+        client.connect(SAMPLE_CREDENTIALS)
+        mock_mqtt_connection.publish.reset_mock()
+
+        client.request_shadow()
+
+        topics = [
+            c.kwargs.get("topic") or c.args[0]
+            for c in mock_mqtt_connection.publish.call_args_list
+        ]
+        assert topics == [f"$aws/things/{SAMPLE_SERIAL}/shadow/get"]
+
     def test_publish_desired_raises_when_not_connected(self, build_client):
         client = build_client()
 
